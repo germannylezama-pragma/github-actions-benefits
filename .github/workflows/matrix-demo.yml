@@ -1,0 +1,47 @@
+name: "Demo · Matriz (muchas ejecuciones, un solo YAML)"
+
+# 3 sistemas operativos × 3 versiones de Node = 9 combinaciones,
+# menos 1 excluida, más 1 experimental añadida = 9 jobs en paralelo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_parallel:
+        description: "Máximo de jobs simultáneos"
+        type: number
+        default: 9
+
+permissions:
+  contents: read
+
+jobs:
+  probar:
+    name: "${{ matrix.os }} · node ${{ matrix.node }}${{ matrix.experimental && ' · experimental' || '' }}"
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22, 24]
+        exclude:
+          - os: macos-latest
+            node: 20
+        include:
+          - os: ubuntu-latest
+            node: 25
+            experimental: true
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Informe
+        shell: bash
+        run: |
+          {
+            echo "| Runner | Node | SO / arquitectura |"
+            echo "|---|---|---|"
+            echo "| \`${{ matrix.os }}\` | $(node --version) | ${RUNNER_OS} / ${RUNNER_ARCH} |"
+          } >> "$GITHUB_STEP_SUMMARY"

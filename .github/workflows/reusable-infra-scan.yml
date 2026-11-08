@@ -1,0 +1,200 @@
+name: "♻️ Reusable · Análisis de infra"
+
+# Workflow REUTILIZABLE: se llama con `uses:` desde este repo, desde otro repo
+# o desde otra rama (…/reusable-infra-scan.yml@<rama|tag|sha>).
+#   Checkov + Trivy + Infracost en paralelo → Job Summary → gate
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Ambiente a analizar (usa infra/terraform/env/<environment>.tfvars)"
+        type: string
+        required: true
+      tf_dir:
+        description: "Carpeta de Terraform"
+        type: string
+        default: infra/terraform
+      budget:
+        description: "Presupuesto mensual en USD para el gate"
+        type: number
+        default: 300
+      trivy_version:
+        type: string
+        default: "0.58.1"
+    secrets:
+      INFRACOST_API_KEY:
+        required: false
+    outputs:
+      approved:
+        description: "true si pasan seguridad y costo"
+        value: ${{ jobs.resumen.outputs.approved }}
+
+permissions:
+  contents: read
+
+env:
+  TF_DIR: ${{ inputs.tf_dir }}
+  ENVIRONMENT: ${{ inputs.environment }}
+  VAR_FILE: env/${{ inputs.environment }}.tfvars
+
+jobs:
+  checkov:
+    name: "🔐 Checkov"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Checkov
+        run: pip install --quiet checkov
+
+      - name: Escanear Terraform (${{ inputs.environment }})
+        run: |
+          checkov -d "$TF_DIR" --framework terraform --soft-fail \
+            --var-file "$TF_DIR/$VAR_FILE" \
+            -o cli -o json -o sarif \
+            --output-file-path console,checkov.json,checkov.sarif
+
+      - name: Publicar en Code Scanning
+        if: always()
+        continue-on-error: true # requiere repo público o GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-${{ inputs.environment }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkov-${{ inputs.environment }}
+          path: checkov.json
+
+  trivy:
+    name: "🔎 Trivy"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Escanear misconfiguraciones (${{ inputs.environment }})
+        run: |
+          img="aquasec/trivy:${{ inputs.trivy_version }}"
+          docker run --rm -v "$PWD:/src" -w /src "$img" \
+            config --tf-vars "$TF_DIR/$VAR_FILE" --format json --output trivy.json "$TF_DIR"
+          docker run --rm -v "$PWD:/src" -w /src "$img" \
+            convert --format sarif --output trivy.sarif trivy.json
+
+      - name: Publicar en Code Scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-${{ inputs.environment }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ inputs.environment }}
+          path: trivy.json
+
+  infracost:
+    name: "💰 Infracost"
+    runs-on: ubuntu-latest
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Hay API key?
+        id: key
+        run: echo "present=$([ -n "$INFRACOST_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Instalar Infracost
+        if: steps.key.outputs.present == 'true'
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Costo de la rama base
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+          git worktree add --detach /tmp/base "origin/${GITHUB_BASE_REF}"
+          base="/tmp/base/$TF_DIR"
+          if [ -d "$base" ]; then
+            args=()
+            [ -f "$base/$VAR_FILE" ] && args=(--terraform-var-file "$VAR_FILE")
+            infracost breakdown --path "$base" "${args[@]}" --format json --out-file infracost-base.json
+          fi
+
+      - name: Costo de este cambio
+        if: steps.key.outputs.present == 'true'
+        run: |
+          infracost breakdown --path "$TF_DIR" --terraform-var-file "$VAR_FILE" \
+            --format json --out-file infracost.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: infracost-${{ inputs.environment }}
+          path: infracost*.json
+          if-no-files-found: ignore
+
+  resumen:
+    name: "📋 Resumen y gate"
+    needs: [checkov, trivy, infracost]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.gate.outputs.approved }}
+    steps:
+      # El script vive en el repo del workflow reutilizable. Si nos llama otro repo, lo traemos de aquí.
+      - uses: actions/checkout@v4
+        if: github.repository == 'germannylezama-pragma/github-actions-benefits'
+        with:
+          path: .pipeline
+          sparse-checkout: .github/scripts
+
+      - uses: actions/checkout@v4
+        if: github.repository != 'germannylezama-pragma/github-actions-benefits'
+        with:
+          repository: germannylezama-pragma/github-actions-benefits
+          path: .pipeline
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: checkov-${{ inputs.environment }}
+          path: reports/checkov
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-${{ inputs.environment }}
+          path: reports/trivy
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # no existe si falta INFRACOST_API_KEY
+        with:
+          name: infracost-${{ inputs.environment }}
+          path: reports/infracost
+
+      - name: Construir Job Summary
+        id: gate
+        env:
+          MONTHLY_BUDGET_USD: ${{ inputs.budget }}
+        run: bash .pipeline/.github/scripts/summary.sh
+
+      - name: Aplicar gate
+        if: steps.gate.outputs.approved != 'true' && vars.ENFORCE_GATE != 'false'
+        run: |
+          echo "::error title=Gate ${ENVIRONMENT}::Hay hallazgos de seguridad o el costo supera el presupuesto. Revisa el Summary."
+          exit 1

@@ -1,0 +1,76 @@
+name: "♻️ Reusable · Deploy a un ambiente"
+
+# Un solo job de deploy para todos los ambientes. Lo que cambia entre
+# dev / staging / prod lo controla el ENVIRONMENT de GitHub:
+#   - reglas de protección (revisores, wait timer, ramas permitidas)
+#   - secrets y variables propios (p. ej. AWS_ROLE_ARN distinto por ambiente)
+#   - historial de despliegues y URL en la pestaña "Deployments"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      tf_dir:
+        type: string
+        default: infra/terraform
+    outputs:
+      url:
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: "🚀 Deploy · ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.url.outputs.url }}
+    # Nunca dos despliegues a la vez sobre el mismo ambiente; el siguiente espera en cola.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC: sin llaves de AWS guardadas
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Credenciales AWS (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }} # variable del ENVIRONMENT
+          aws-region: us-east-1
+
+      - name: Terraform apply
+        if: vars.AWS_ROLE_ARN != ''
+        working-directory: ${{ inputs.tf_dir }}
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve -var-file="env/${{ inputs.environment }}.tfvars"
+
+      - name: Deploy simulado
+        if: vars.AWS_ROLE_ARN == ''
+        run: echo "Sin AWS_ROLE_ARN en el environment ${{ inputs.environment }}, deploy simulado."
+
+      - name: URL del ambiente
+        id: url
+        run: echo "url=https://${{ inputs.environment }}.demo.example.com" >> "$GITHUB_OUTPUT"
+
+      - name: Resumen
+        run: |
+          {
+            echo "### 🚀 Deploy · \`${{ inputs.environment }}\`"
+            echo
+            echo "| Rama | Commit | Lanzado por | Modo |"
+            echo "|---|---|---|---|"
+            echo "| \`${GITHUB_REF_NAME}\` | \`${GITHUB_SHA:0:7}\` | @${GITHUB_ACTOR} | ${{ vars.AWS_ROLE_ARN != '' && 'real (OIDC)' || 'simulado' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

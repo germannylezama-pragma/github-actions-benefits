@@ -1,0 +1,73 @@
+name: "Infra · Análisis multi-ambiente y promoción"
+
+# Orquestador. Muestra:
+#   - Varios disparadores: PR, push, manual con inputs, y desde otro sistema por API
+#   - Matriz: el MISMO análisis reutilizable corre en paralelo para dev, staging y prod
+#   - Promoción controlada: dev → staging → prod, cada uno con su environment
+
+on:
+  pull_request:
+    paths: ["infra/**", ".github/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+  workflow_dispatch: # Actions → Run workflow → eliges la RAMA y hasta qué ambiente
+    inputs:
+      hasta:
+        description: "Desplegar hasta"
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+  repository_dispatch: # desde otro repo/sistema: gh api repos/OWNER/REPO/dispatches ...
+    types: [deploy-infra]
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analizar:
+    name: "Análisis · ${{ matrix.environment }}"
+    strategy:
+      fail-fast: false # si falla prod, igual vemos el resultado de dev y staging
+      matrix:
+        include:
+          - environment: dev
+            budget: 150
+          - environment: staging
+            budget: 300
+          - environment: prod
+            budget: 800
+    uses: ./.github/workflows/reusable-infra-scan.yml
+    with:
+      environment: ${{ matrix.environment }}
+      budget: ${{ matrix.budget }}
+    secrets: inherit
+
+  deploy-dev:
+    needs: analizar
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: dev
+    secrets: inherit
+
+  deploy-staging:
+    needs: deploy-dev
+    if: (inputs.hasta || github.event.client_payload.hasta || 'prod') != 'dev'
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: staging
+    secrets: inherit
+
+  deploy-prod:
+    needs: deploy-staging
+    if: (inputs.hasta || github.event.client_payload.hasta || 'prod') == 'prod'
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: prod
+    secrets: inherit
