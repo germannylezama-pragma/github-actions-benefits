@@ -1,0 +1,37 @@
+name: "Auditoría nocturna · todos los ambientes"
+
+# MATRIZ: el mismo análisis reutilizable corre en paralelo sobre la rama de
+# cada ambiente, cada uno con su presupuesto. Detecta problemas nuevos
+# (reglas nuevas de Checkov/Trivy, cambios de precio) aunque nadie haga push.
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5" # 06:00 hora Colombia, lunes a viernes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  auditar:
+    name: "Auditoría · ${{ matrix.environment }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            rama: dev
+            budget: 150
+          - environment: staging
+            rama: staging
+            budget: 300
+          - environment: prod
+            rama: main
+            budget: 800
+    uses: ./.github/workflows/reusable-infra-scan.yml
+    with:
+      environment: ${{ matrix.environment }}
+      ref: ${{ matrix.rama }}
+      budget: ${{ matrix.budget }}
+    secrets: inherit

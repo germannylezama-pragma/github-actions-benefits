@@ -1,24 +1,21 @@
-name: "Infra · Análisis multi-ambiente y promoción"
+name: "Infra · Análisis y deploy por rama"
+run-name: "Infra · ${{ github.base_ref || github.ref_name }} (${{ github.event_name }})"
 
-# Orquestador. Muestra:
-#   - Varios disparadores: PR, push, manual con inputs, y desde otro sistema por API
-#   - Matriz: el MISMO análisis reutilizable corre en paralelo para dev, staging y prod
-#   - Promoción controlada: dev → staging → prod, cada uno con su environment
+# Tres fases, y la RAMA decide el ambiente:
+#   Fase 1 · Análisis   Checkov ∥ Trivy ∥ Infracost
+#   Fase 2 · Revisión   Job Summary + gate
+#   Fase 3 · Deploy     solo en ramas deploy/<ambiente>
+#
+#   dev → dev · staging → staging · main → prod · deploy/<amb> → <amb> + deploy
 
 on:
   pull_request:
+    branches: [dev, staging, main, "deploy/**"]
     paths: ["infra/**", ".github/**"]
   push:
-    branches: [main]
-    paths: ["infra/**"]
-  workflow_dispatch: # Actions → Run workflow → eliges la RAMA y hasta qué ambiente
-    inputs:
-      hasta:
-        description: "Desplegar hasta"
-        type: choice
-        options: [dev, staging, prod]
-        default: dev
-  repository_dispatch: # desde otro repo/sistema: gh api repos/OWNER/REPO/dispatches ...
+    branches: [dev, staging, main, "deploy/**"]
+  workflow_dispatch: # Run workflow: el ambiente sale de la rama que elijas
+  repository_dispatch: # desde otro sistema: client_payload = {"environment": "...", "deploy": true}
     types: [deploy-infra]
 
 permissions:
@@ -30,53 +27,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  contexto:
+    uses: ./.github/workflows/reusable-contexto.yml
+
   analizar:
-    name: "Análisis · ${{ matrix.environment }}"
-    strategy:
-      fail-fast: false # si falla prod, igual vemos el resultado de dev y staging
-      matrix:
-        include:
-          - environment: dev
-            budget: 150
-          - environment: staging
-            budget: 300
-          - environment: prod
-            budget: 800
+    name: "Análisis · ${{ needs.contexto.outputs.environment }}"
+    needs: contexto
     uses: ./.github/workflows/reusable-infra-scan.yml
     with:
-      environment: ${{ matrix.environment }}
-      budget: ${{ matrix.budget }}
+      environment: ${{ needs.contexto.outputs.environment }}
+      budget: ${{ fromJSON(needs.contexto.outputs.budget) }}
     secrets: inherit
 
-  deploy-dev:
-    needs: analizar
-    if: github.event_name != 'pull_request'
+  deploy:
+    name: "Deploy · ${{ needs.contexto.outputs.environment }}"
+    needs: [contexto, analizar]
+    if: needs.contexto.outputs.deploy == 'true'
     permissions: # el reutilizable no puede pedir más de lo que concede quien lo llama
       contents: read
       id-token: write
     uses: ./.github/workflows/reusable-deploy.yml
     with:
-      environment: dev
-    secrets: inherit
-
-  deploy-staging:
-    needs: deploy-dev
-    if: (inputs.hasta || github.event.client_payload.hasta || 'prod') != 'dev'
-    permissions: # el reutilizable no puede pedir más de lo que concede quien lo llama
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/reusable-deploy.yml
-    with:
-      environment: staging
-    secrets: inherit
-
-  deploy-prod:
-    needs: deploy-staging
-    if: (inputs.hasta || github.event.client_payload.hasta || 'prod') == 'prod'
-    permissions: # el reutilizable no puede pedir más de lo que concede quien lo llama
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/reusable-deploy.yml
-    with:
-      environment: prod
+      environment: ${{ needs.contexto.outputs.environment }}
     secrets: inherit

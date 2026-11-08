@@ -1,0 +1,78 @@
+name: "♻️ Reusable · Rama → ambiente"
+
+# Decide a partir de la rama:
+#   dev → dev · staging → staging · main → prod        (solo análisis)
+#   deploy/<ambiente>                                   (análisis + DEPLOY)
+# Un PR toma la rama DESTINO y nunca despliega.
+
+on:
+  workflow_call:
+    inputs:
+      presupuestos:
+        description: 'JSON ambiente → presupuesto mensual USD. Solo estos ambientes son válidos.'
+        type: string
+        default: '{"dev":150,"staging":300,"prod":800}'
+    outputs:
+      environment:
+        value: ${{ jobs.mapear.outputs.environment }}
+      deploy:
+        value: ${{ jobs.mapear.outputs.deploy }}
+      budget:
+        value: ${{ jobs.mapear.outputs.budget }}
+
+permissions:
+  contents: read
+
+jobs:
+  mapear:
+    name: "🧭 Rama → ambiente"
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.map.outputs.environment }}
+      deploy: ${{ steps.map.outputs.deploy }}
+      budget: ${{ steps.map.outputs.budget }}
+    steps:
+      - id: map
+        env:
+          EVENTO: ${{ github.event_name }}
+          RAMA: ${{ github.base_ref || github.ref_name }}
+          PAYLOAD_ENV: ${{ github.event.client_payload.environment }}
+          PAYLOAD_DEPLOY: ${{ github.event.client_payload.deploy }}
+          PRESUPUESTOS: ${{ inputs.presupuestos }}
+        run: |
+          deploy=false
+          case "$RAMA" in
+            deploy/*) env="${RAMA#deploy/}"; deploy=true ;;
+            main)     env=prod ;;
+            staging)  env=staging ;;
+            *)        env=dev ;;  # dev y cualquier otra rama
+          esac
+
+          # Desde otro sistema por API: el payload elige ambiente y si despliega.
+          if [ "$EVENTO" = "repository_dispatch" ]; then
+            env="${PAYLOAD_ENV:-$env}"
+            [ "$PAYLOAD_DEPLOY" = "true" ] && deploy=true
+          fi
+
+          # Un PR solo muestra el análisis; despliega el merge.
+          [ "$EVENTO" = "pull_request" ] && deploy=false
+
+          budget=$(jq -r --arg e "$env" '.[$e] // empty' <<<"$PRESUPUESTOS")
+          if [ -z "$budget" ]; then
+            echo "::error title=Ambiente desconocido::'$env' no está en presupuestos: $PRESUPUESTOS"
+            exit 1
+          fi
+
+          {
+            echo "environment=$env"
+            echo "deploy=$deploy"
+            echo "budget=$budget"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 🧭 Rama → ambiente"
+            echo
+            echo "| Evento | Rama | Ambiente | Presupuesto | Fase 3: Deploy |"
+            echo "|---|---|---|---:|---|"
+            echo "| \`$EVENTO\` | \`$RAMA\` | **$env** | \$$budget | $([ "$deploy" = true ] && echo '✅ sí' || echo '⏭️ no (solo ramas deploy/*)') |"
+          } >> "$GITHUB_STEP_SUMMARY"

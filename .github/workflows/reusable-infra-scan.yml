@@ -19,6 +19,10 @@ on:
         description: "Presupuesto mensual en USD para el gate"
         type: number
         default: 300
+      ref:
+        description: "Rama, tag o SHA a analizar (vacío = la del evento)"
+        type: string
+        default: ""
       trivy_version:
         type: string
         default: "0.58.1"
@@ -47,6 +51,8 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -83,6 +89,8 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Escanear misconfiguraciones (${{ inputs.environment }})
         run: |
@@ -112,6 +120,8 @@ jobs:
       INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: ¿Hay API key?
         id: key
