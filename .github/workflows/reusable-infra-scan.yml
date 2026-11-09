@@ -116,6 +116,11 @@ jobs:
   infracost:
     name: "💰 Infracost"
     runs-on: ubuntu-latest
+    # FEATURE (feature/comentario-costo): comentar el costo en el PR.
+    # Quien llame a esta versión debe conceder pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
     env:
       INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
     steps:
@@ -150,6 +155,24 @@ jobs:
         run: |
           infracost breakdown --path "$TF_DIR" --terraform-var-file "$VAR_FILE" \
             --format json --out-file infracost.json
+
+      # FEATURE: un comentario en el PR con cuánto sube o baja el costo mensual.
+      # Se actualiza en cada push (--behavior update), no se acumulan comentarios.
+      - name: 💬 Comentar el costo en el PR
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          src=infracost.json
+          if [ -f infracost-base.json ]; then
+            infracost diff --path "$TF_DIR" --terraform-var-file "$VAR_FILE" \
+              --compare-to infracost-base.json --format json --out-file diff-costo.json
+            src=diff-costo.json
+          fi
+          infracost comment github --path "$src" \
+            --repo "$GITHUB_REPOSITORY" --pull-request "$PR" \
+            --github-token "$GITHUB_TOKEN" --behavior update
 
       - uses: actions/upload-artifact@v4
         with:

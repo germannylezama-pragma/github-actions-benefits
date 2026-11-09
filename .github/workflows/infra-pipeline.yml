@@ -34,6 +34,10 @@ jobs:
   analizar:
     name: "Análisis · ${{ needs.contexto.outputs.environment }}"
     needs: contexto
+    permissions: # la versión con comentario de costo necesita escribir en el PR
+      contents: read
+      security-events: write
+      pull-requests: write
     uses: ./.github/workflows/reusable-infra-scan.yml
     with:
       environment: ${{ needs.contexto.outputs.environment }}

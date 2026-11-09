@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  pull-requests: write # lo pide la versión con comentario de costo
 
 jobs:
   auditar:
