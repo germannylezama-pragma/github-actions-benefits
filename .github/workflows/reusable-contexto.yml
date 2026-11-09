@@ -42,6 +42,7 @@ jobs:
             deploy/*) env="${RAMA#deploy/}"; deploy=true ;;
             main)     env=prod ;;
             staging)  env=staging ;;
+            cert)     env=cert ;;  # solo válido si el repo lo lista en "ambientes"
             *)        env=dev ;;  # dev y cualquier otra rama
           esac
 
