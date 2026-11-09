@@ -22,13 +22,13 @@ jobs:
         include:
           - environment: dev
             rama: dev
-            budget: 150
+            budget: "150" # referencia para la auditoría; el deploy usa vars.MONTHLY_BUDGET_USD
           - environment: staging
             rama: staging
-            budget: 300
+            budget: "100"
           - environment: prod
             rama: main
-            budget: 800
+            budget: "200"
     uses: ./.github/workflows/reusable-infra-scan.yml
     with:
       environment: ${{ matrix.environment }}

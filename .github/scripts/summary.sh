@@ -4,7 +4,7 @@
 set -euo pipefail
 
 R="${REPORTS_DIR:-reports}"
-BUDGET="${MONTHLY_BUDGET_USD:-300}"
+BUDGET="${MONTHLY_BUDGET_USD:-}" # vacío = el presupuesto lo valida el environment en el deploy
 OUT="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 GATE_OUT="${GITHUB_OUTPUT:-/dev/null}"
 
@@ -45,7 +45,10 @@ if [ -f "$ic_file" ]; then
 fi
 cost_delta=$(awk -v a="$cost_now" -v b="$cost_base" 'BEGIN{d=a-b; printf "%s$%.2f", (d<0 ? "-" : "+"), (d<0 ? -d : d)}')
 cost_now_fmt=$(awk -v a="$cost_now" 'BEGIN{printf "%.2f", a}')
-ic_ok=$(awk -v a="$cost_now" -v b="$BUDGET" 'BEGIN{print (a<=b) ? "true" : "false"}')
+ic_ok=true
+if [ -n "$BUDGET" ]; then
+  ic_ok=$(awk -v a="$cost_now" -v b="$BUDGET" 'BEGIN{print (a<=b) ? "true" : "false"}')
+fi
 # Sin API key de Infracost el control se omite (no bloquea).
 [ "$ic_ran" = false ] && ic_ok=true
 
@@ -72,17 +75,21 @@ echo "approved=$approved" >> "$GATE_OUT"
     echo "| 🔎 **Trivy** | sin reporte | ❌ |"
   fi
   if [ "$ic_ran" = true ]; then
-    echo "| 💰 **Infracost** (costo mensual) | **\$${cost_now_fmt}/mes** (${cost_delta} vs base) · presupuesto \$${BUDGET} | $(ok "$ic_ok") |"
+    if [ -n "$BUDGET" ]; then
+      echo "| 💰 **Infracost** (costo mensual) | **\$${cost_now_fmt}/mes** (${cost_delta} vs base) · presupuesto \$${BUDGET} | $(ok "$ic_ok") |"
+    else
+      echo "| 💰 **Infracost** (costo mensual) | **\$${cost_now_fmt}/mes** (${cost_delta} vs base) · el presupuesto lo valida el environment en el deploy | ℹ️ |"
+    fi
   else
     echo "| 💰 **Infracost** | omitido: falta el secret \`INFRACOST_API_KEY\` | ⏭️ |"
   fi
   echo
   if [ "$approved" = true ]; then
     echo "### ✅ Decisión: listo para desplegar"
-    echo "Todos los controles pasan. El despliegue espera la aprobación del environment \`production\`."
+    echo "Seguridad OK. En el deploy, el environment aplica sus reglas: aprobación y presupuesto (\`MONTHLY_BUDGET_USD\`)."
   else
     echo "### ⛔ Decisión: despliegue bloqueado"
-    echo "Corrige los hallazgos de abajo o ajusta el presupuesto (\`vars.MONTHLY_BUDGET_USD\`)."
+    echo "Corrige los hallazgos de abajo."
   fi
   echo
 

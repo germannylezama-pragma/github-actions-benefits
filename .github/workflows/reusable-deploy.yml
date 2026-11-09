@@ -3,7 +3,7 @@ name: "♻️ Reusable · Deploy a un ambiente"
 # Un solo job de deploy para todos los ambientes. Lo que cambia entre
 # dev / staging / prod lo controla el ENVIRONMENT de GitHub:
 #   - reglas de protección (revisores, wait timer, ramas permitidas)
-#   - secrets y variables propios (p. ej. AWS_ROLE_ARN distinto por ambiente)
+#   - variables propias: MONTHLY_BUDGET_USD (presupuesto) y AWS_ROLE_ARN
 #   - historial de despliegues y URL en la pestaña "Deployments"
 
 on:
@@ -31,7 +31,7 @@ jobs:
       url: ${{ steps.url.outputs.url }}
     # Nunca dos despliegues a la vez sobre el mismo ambiente; el siguiente espera en cola.
     concurrency:
-      group: deploy-${{ inputs.environment }}
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -39,6 +39,55 @@ jobs:
     outputs:
       url: ${{ steps.url.outputs.url }}
     steps:
+      # ── Presupuesto del ENVIRONMENT ─────────────────────────────────────
+      # El costo lo calculó Infracost en la fase 1 (artefacto de este mismo run).
+      # El límite NO está en el código: es la variable MONTHLY_BUDGET_USD del
+      # environment, la cambia su dueño en Settings → Environments.
+      - name: Costo estimado (de la fase 1)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: infracost-${{ inputs.environment }}
+          path: reports/infracost
+
+      - name: 💰 Presupuesto del environment
+        env:
+          BUDGET: ${{ vars.MONTHLY_BUDGET_USD }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          f=reports/infracost/infracost.json
+          {
+            echo "### 💰 Presupuesto · \`$ENVIRONMENT\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$BUDGET" ]; then
+            echo "> ⏭️ El environment \`$ENVIRONMENT\` no tiene \`MONTHLY_BUDGET_USD\`: sin control de presupuesto." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -f "$f" ]; then
+            echo "> ⏭️ Sin estimación de Infracost (falta \`INFRACOST_API_KEY\`): no se puede comparar." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          cost=$(jq -r '.totalMonthlyCost // "0"' "$f")
+          read -r ok pct diff < <(awk -v c="$cost" -v b="$BUDGET" \
+            'BEGIN{ printf "%s %.0f %.2f\n", (c<=b ? "true" : "false"), (b>0 ? c*100/b : 0), c-b }')
+
+          {
+            echo "| Costo estimado | Presupuesto (\`vars.MONTHLY_BUDGET_USD\`) | Uso | Estado |"
+            echo "|---:|---:|---:|---|"
+            printf '| **$%.2f**/mes | $%s/mes | %s%% | %s |\n' "$cost" "$BUDGET" "$pct" "$([ "$ok" = true ] && echo '✅ dentro' || echo '❌ excedido')"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ok" != true ]; then
+            echo "> ⛔ **Deploy cancelado**: se pasa por \$$diff/mes. Reduce la infra o pide subir el presupuesto del environment." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Presupuesto ${ENVIRONMENT} excedido::Costo \$${cost}/mes > presupuesto \$${BUDGET}/mes (vars.MONTHLY_BUDGET_USD del environment ${ENVIRONMENT})"
+            exit 1
+          fi
+
+      # ── Deploy ──────────────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3

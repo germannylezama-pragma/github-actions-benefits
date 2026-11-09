@@ -4,7 +4,8 @@ run-name: "Infra · ${{ github.base_ref || github.ref_name }} (${{ github.event_
 # Tres fases, y la RAMA decide el ambiente:
 #   Fase 1 · Análisis   Checkov ∥ Trivy ∥ Infracost
 #   Fase 2 · Revisión   Job Summary + gate
-#   Fase 3 · Deploy     solo en ramas deploy/<ambiente>
+#   Fase 3 · Deploy     solo en ramas deploy/<ambiente>, si el costo cabe en el
+#                       presupuesto del environment (vars.MONTHLY_BUDGET_USD)
 #
 #   dev → dev · staging → staging · main → prod · deploy/<amb> → <amb> + deploy
 
@@ -36,7 +37,6 @@ jobs:
     uses: ./.github/workflows/reusable-infra-scan.yml
     with:
       environment: ${{ needs.contexto.outputs.environment }}
-      budget: ${{ fromJSON(needs.contexto.outputs.budget) }}
     secrets: inherit
 
   deploy:

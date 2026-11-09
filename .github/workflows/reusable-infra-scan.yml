@@ -16,9 +16,9 @@ on:
         type: string
         default: infra/terraform
       budget:
-        description: "Presupuesto mensual en USD para el gate"
-        type: number
-        default: 300
+        description: "Presupuesto mensual USD (opcional). Vacío = solo informa el costo; lo valida el environment en el deploy"
+        type: string
+        default: ""
       ref:
         description: "Rama, tag o SHA a analizar (vacío = la del evento)"
         type: string
