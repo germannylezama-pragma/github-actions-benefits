@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ejemplo para el PR: una cola SQS. Le falta el cifrado a propósito para que
+  el análisis del PR lo detecte (arreglo: agregar KmsMasterKeyId: alias/aws/sqs).
+
+Parameters:
+  Prefijo:
+    Type: String
+    Default: gha-demo
+    AllowedPattern: "[a-zA-Z0-9-]+"
+  Ambiente:
+    Type: String
+    AllowedValues: [dev, staging, prod, test, cert]
+    Default: dev
+
+Resources:
+  ColaEventos:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Prefijo}-${Ambiente}-sqs-eventos
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: false # ← hallazgo: cola sin cifrar
+      Tags:
+        - Key: Nombre
+          Value: !Sub ${Prefijo}-${Ambiente}-sqs-eventos
+        - Key: Descripcion
+          Value: Cola de ejemplo para la demo de PR
+        - Key: Criticidad
+          Value: Baja
+
+Outputs:
+  QueueUrl:
+    Value: !Ref ColaEventos
