@@ -1,11 +1,8 @@
 name: "PR · Analizar solo lo que cambia"
 run-name: "PR #${{ github.event.pull_request.number }} · ${{ github.head_ref }} → ${{ github.base_ref }}"
 
-# En un pull request no se revisa toda la rama: solo los archivos de infra que
-# el PR CREA o MODIFICA. El resultado queda en el Job Summary y como comentario
-# en el PR. No despliega nada.
-#   CloudFormation (cloudformation/**/*.yaml|yml|json) → cfn-lint + Checkov
-#   Terraform (*.tf)                                   → Checkov
+# En un PR revisa solo los archivos de infra que el PR crea o modifica y comenta
+# el resultado. La lógica vive en reusable-pr-cambios.yml: infra-equipo usa el mismo.
 
 on:
   pull_request:
@@ -14,146 +11,12 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # para comentar en el PR
+  pull-requests: write
 
 concurrency:
   group: pr-cambios-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  cambios:
-    name: "🔎 Archivos que cambian"
-    runs-on: ubuntu-latest
-    outputs:
-      cfn: ${{ steps.diff.outputs.cfn }}
-      tf: ${{ steps.diff.outputs.tf }}
-      total: ${{ steps.diff.outputs.total }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # historia completa para comparar con la rama destino
-
-      - name: Comparar con la rama destino
-        id: diff
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # A = creado, M = modificado (los borrados no se analizan)
-          git diff --name-status --diff-filter=AM "$BASE...$HEAD" > cambios.txt
-          cat cambios.txt
-
-          cfn=$(awk '$2 ~ /^cloudformation\/.*\.(ya?ml|json)$/ {print $2}' cambios.txt | xargs)
-          tf=$(awk '$2 ~ /\.tf$/ {print $2}' cambios.txt | xargs)
-          total=$(wc -w <<<"$cfn $tf")
-          {
-            echo "cfn=$cfn"
-            echo "tf=$tf"
-            echo "total=$total"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## 🔎 PR #${{ github.event.pull_request.number }}: archivos de infra que cambian"
-            echo
-            echo "| Estado | Archivo | Se analiza con |"
-            echo "|---|---|---|"
-            awk '{
-              st = ($1=="A") ? "🆕 nuevo" : "✏️ modificado"
-              if ($2 ~ /^cloudformation\/.*\.(ya?ml|json)$/) tool="cfn-lint + Checkov"
-              else if ($2 ~ /\.tf$/) tool="Checkov (Terraform)"
-              else next
-              printf "| %s | `%s` | %s |\n", st, $2, tool
-            }' cambios.txt
-            echo
-            echo "_El resto de la rama no se analiza: solo lo que trae este PR._"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  analizar:
-    name: "🔐 Analizar cambios"
-    needs: cambios
-    if: needs.cambios.outputs.total != '0'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - run: pip install --quiet checkov cfn-lint
-
-      - name: cfn-lint (plantillas que cambian)
-        id: lint
-        if: needs.cambios.outputs.cfn != ''
-        run: |
-          set +e
-          cfn-lint ${{ needs.cambios.outputs.cfn }} --format parseable > cfn-lint.txt
-          rc=$?
-          cat cfn-lint.txt
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-
-      - name: Checkov (solo los archivos que cambian)
-        run: |
-          args=()
-          for f in ${{ needs.cambios.outputs.cfn }} ${{ needs.cambios.outputs.tf }}; do args+=(-f "$f"); done
-          checkov "${args[@]}" --soft-fail --compact -o cli -o json --output-file-path console,checkov.json
-
-      - name: Resumen, comentario y gate
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-          LINT_RC: ${{ steps.lint.outputs.rc || '0' }}
-        run: |
-          passed=$(jq '[.. | objects | select(has("summary")) | .summary.passed] | add // 0' checkov.json)
-          failed=$(jq '[.. | objects | select(has("summary")) | .summary.failed] | add // 0' checkov.json)
-          lint_n=$(grep -c . cfn-lint.txt 2>/dev/null) || lint_n=0
-          lint_err=$(( (LINT_RC & 2) != 0 ))
-          ok=$([ "$failed" -eq 0 ] && [ "$lint_err" -eq 0 ] && echo true || echo false)
-
-          {
-            echo "### 🔐 Resultado del análisis de este PR"
-            echo
-            echo "| Herramienta | Resultado | Estado |"
-            echo "|---|---|---|"
-            [ -n "${{ needs.cambios.outputs.cfn }}" ] && \
-              echo "| 🧹 cfn-lint | $lint_n observaciones | $([ "$lint_err" -eq 0 ] && echo ✅ || echo ❌) |"
-            echo "| 🔐 Checkov | $passed pasan · $failed fallan | $([ "$failed" -eq 0 ] && echo ✅ || echo ❌) |"
-            echo
-            if [ "$failed" -gt 0 ]; then
-              echo "| Check | Archivo | Recurso | Descripción |"
-              echo "|---|---|---|---|"
-              jq -r '[.. | objects | select(has("failed_checks")) | .failed_checks[]] | .[] |
-                "| \(.check_id) | `\(.file_path | ltrimstr("/"))` | `\(.resource)` | \(.check_name) |"' checkov.json
-              echo
-            fi
-            if [ "$lint_n" -gt 0 ]; then
-              echo '```'
-              cat cfn-lint.txt
-              echo '```'
-              echo
-            fi
-            echo "**$([ "$ok" = true ] && echo '✅ Los cambios de este PR pasan.' || echo '❌ Los cambios de este PR tienen hallazgos.')**"
-          } > resultado.md
-
-          cat resultado.md >> "$GITHUB_STEP_SUMMARY"
-
-          # Un solo comentario por PR: se actualiza en cada push
-          { echo "<!-- pr-cambios -->"; cat resultado.md; echo; echo "_Detalle: [ejecución]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"; } > comentario.md
-          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-                 --jq '[.[] | select(.body | startswith("<!-- pr-cambios -->"))][0].id // empty')
-          if [ -n "$id" ]; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comentario.md >/dev/null
-          else
-            gh pr comment "$PR" --body-file comentario.md
-          fi
-
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
-
-      - name: Aplicar gate
-        if: steps.gate.outputs.ok != 'true' && vars.ENFORCE_GATE != 'false'
-        run: |
-          echo "::error title=Hallazgos en el PR::Los archivos que trae este PR tienen hallazgos. Revisa el comentario."
-          exit 1
+  pr:
+    uses: ./.github/workflows/reusable-pr-cambios.yml
