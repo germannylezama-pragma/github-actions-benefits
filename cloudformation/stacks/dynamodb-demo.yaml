@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Demo GitHub Actions: tabla DynamoDB on-demand (sin datos = USD 0/mes).
+  La despliega .github/workflows/cfn-pipeline.yml desde la rama deploy/dev.
+
+Parameters:
+  Prefijo:
+    Type: String
+    Default: gha-demo
+    AllowedPattern: "[a-zA-Z0-9-]+"
+  Ambiente:
+    Type: String
+    AllowedValues: [dev, staging, prod, test, cert]
+    Default: dev
+  Criticidad:
+    Type: String
+    Default: Baja
+
+Resources:
+  TablaDemo:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${Prefijo}-${Ambiente}-dynamodb-demo
+      BillingMode: PAY_PER_REQUEST # se paga solo por uso: vacía no cuesta
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb # llave administrada por AWS, sin costo
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: false # es una demo: se borra al terminar
+      Tags:
+        - Key: Nombre
+          Value: !Sub ${Prefijo}-${Ambiente}-dynamodb-demo
+        - Key: Descripcion
+          Value: Tabla demo desplegada por GitHub Actions con OIDC
+        - Key: Criticidad
+          Value: !Ref Criticidad
+
+Outputs:
+  TableName:
+    Value: !Ref TablaDemo
+  TableArn:
+    Value: !GetAtt TablaDemo.Arn
+  ConsoleUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/dynamodbv2/home?region=${AWS::Region}#table?name=${TablaDemo}

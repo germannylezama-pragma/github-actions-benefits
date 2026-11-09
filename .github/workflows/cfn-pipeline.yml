@@ -1,0 +1,146 @@
+name: "Infra · CloudFormation por rama"
+run-name: "CFN · ${{ github.base_ref || github.ref_name }} (${{ github.event_name }})"
+
+# Polivalencia: mismo modelo de 3 fases que infra-pipeline.yml (Terraform),
+# reutilizando el MISMO reusable-contexto.yml, pero con otra herramienta de IaC.
+#   Fase 1: cfn-lint ∥ Checkov (framework cloudformation)
+#   Fase 2: Summary + gate
+#   Fase 3: change set + deploy real por OIDC (solo ramas deploy/*)
+
+on:
+  pull_request:
+    branches: [dev, staging, main, "deploy/**"]
+    paths: ["cloudformation/**", ".github/workflows/cfn-pipeline.yml", ".github/workflows/reusable-deploy-cfn.yml"]
+  push:
+    branches: [dev, staging, main, "deploy/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cfn-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TEMPLATE: cloudformation/stacks/dynamodb-demo.yaml
+
+jobs:
+  contexto:
+    uses: ./.github/workflows/reusable-contexto.yml
+
+  cfn-lint:
+    name: "🧹 cfn-lint"
+    needs: contexto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet cfn-lint
+      - name: Validar sintaxis y propiedades
+        run: |
+          set +e
+          cfn-lint "$TEMPLATE" --format parseable > cfn-lint.txt
+          echo "rc=$?" > cfn-lint.rc
+          cat cfn-lint.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfn-lint
+          path: cfn-lint.*
+
+  checkov:
+    name: "🔐 Checkov (CloudFormation)"
+    needs: contexto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet checkov
+      - name: Escanear plantilla
+        run: |
+          checkov -f "$TEMPLATE" --framework cloudformation --soft-fail \
+            -o cli -o json --output-file-path console,checkov.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkov-cfn
+          path: checkov.json
+
+  resumen:
+    name: "📋 Resumen y gate"
+    needs: [contexto, cfn-lint, checkov]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Construir Job Summary
+        id: gate
+        env:
+          ENVIRONMENT: ${{ needs.contexto.outputs.environment }}
+        run: |
+          ck=reports/checkov-cfn/checkov.json
+          passed=$(jq '[.. | objects | select(has("summary")) | .summary.passed] | add // 0' "$ck")
+          failed=$(jq '[.. | objects | select(has("summary")) | .summary.failed] | add // 0' "$ck")
+          lint_rc=$(cut -d= -f2 reports/cfn-lint/cfn-lint.rc)
+          lint_n=$(grep -c . reports/cfn-lint/cfn-lint.txt || true)
+          # cfn-lint: bit 2 = errores (warnings/info no bloquean)
+          lint_ok=$(( (lint_rc & 2) == 0 ))
+
+          ok() { [ "$1" = 1 ] && echo "✅" || echo "❌"; }
+          ck_ok=$([ "$failed" -eq 0 ] && echo 1 || echo 0)
+          approved=$([ "$ck_ok" = 1 ] && [ "$lint_ok" = 1 ] && echo true || echo false)
+
+          {
+            echo "## ☁️ CloudFormation · Análisis · \`${ENVIRONMENT}\`"
+            echo
+            echo "| Herramienta | Resultado | Estado |"
+            echo "|---|---|---|"
+            echo "| 🧹 cfn-lint | $lint_n observaciones (código $lint_rc) | $(ok $lint_ok) |"
+            echo "| 🔐 Checkov | $passed pasan · $failed fallan | $(ok $ck_ok) |"
+            echo
+            echo "**Gate:** $([ "$approved" = true ] && echo '✅ aprobado' || echo '❌ bloqueado')"
+            if [ "$failed" -gt 0 ]; then
+              echo
+              echo "<details><summary>Hallazgos de Checkov</summary>"
+              echo
+              echo "| Check | Recurso | Descripción |"
+              echo "|---|---|---|"
+              jq -r '[.. | objects | select(has("failed_checks")) | .failed_checks[]] | .[] |
+                "| \(.check_id) | `\(.resource)` | \(.check_name) |"' "$ck"
+              echo "</details>"
+            fi
+            if [ "$lint_n" -gt 0 ]; then
+              echo
+              echo "<details><summary>Observaciones de cfn-lint</summary>"
+              echo
+              echo '```'
+              cat reports/cfn-lint/cfn-lint.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "approved=$approved" >> "$GITHUB_OUTPUT"
+      - name: Aplicar gate
+        if: steps.gate.outputs.approved != 'true' && vars.ENFORCE_GATE != 'false'
+        run: |
+          echo "::error title=Gate CloudFormation::Hay hallazgos de seguridad o errores de plantilla. Revisa el Summary."
+          exit 1
+
+  deploy:
+    name: "Deploy · ${{ needs.contexto.outputs.environment }}"
+    needs: [contexto, resumen]
+    if: needs.contexto.outputs.deploy == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/reusable-deploy-cfn.yml
+    with:
+      environment: ${{ needs.contexto.outputs.environment }}
+      template: cloudformation/stacks/dynamodb-demo.yaml
+      stack_suffix: dynamodb-demo
+    secrets: inherit

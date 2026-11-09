@@ -1,0 +1,188 @@
+name: "♻️ Reusable · Deploy CloudFormation"
+
+# Mismo patrón que reusable-deploy.yml (Terraform), pero con CloudFormation:
+#   OIDC → change set → se muestra en el Summary → se ejecuta → outputs del stack.
+# Despliega de verdad si el environment tiene AWS_CFN_ROLE_ARN (OIDC) o credenciales
+# temporales como secrets; si no, simula. Ambiente AWS = variable AWS_ENV.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      template:
+        type: string
+        required: true
+      stack_suffix:
+        description: "Stack = <STACK_PREFIX>-<AWS_ENV>-cfn-<stack_suffix>"
+        type: string
+        required: true
+      aws_region:
+        type: string
+        default: us-east-1
+    outputs:
+      url:
+        value: ${{ jobs.deploy.outputs.url }}
+
+jobs:
+  deploy:
+    name: "🚀 CloudFormation · ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.out.outputs.url }}
+    concurrency:
+      group: deploy-cfn-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      url: ${{ steps.out.outputs.url }}
+    env:
+      AWS_ENV: ${{ vars.AWS_ENV || inputs.environment }}
+      PREFIX: ${{ vars.STACK_PREFIX || 'gha-demo' }}
+      TEMPLATE: ${{ inputs.template }}
+      AWS_REGION: ${{ inputs.aws_region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nombre del stack
+        run: echo "STACK=${PREFIX}-${AWS_ENV}-cfn-${{ inputs.stack_suffix }}" >> "$GITHUB_ENV"
+
+      # Tres formas de entrar a AWS, en orden de preferencia:
+      #   oidc     → variable AWS_CFN_ROLE_ARN (rol que confía en GitHub, sin secretos)
+      #   temporal → secrets AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN del environment (expiran solas)
+      #   simulado → nada configurado
+      - name: ¿Cómo entro a AWS?
+        id: modo
+        env:
+          HAY_LLAVES: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SESSION_TOKEN != '' }}
+        run: |
+          if [ -n "${{ vars.AWS_CFN_ROLE_ARN }}" ]; then m=oidc
+          elif [ "$HAY_LLAVES" = true ]; then m=temporal
+          else m=simulado; fi
+          echo "modo=$m" >> "$GITHUB_OUTPUT"
+          echo "Modo de acceso: $m"
+
+      - name: Credenciales AWS por OIDC (sin llaves guardadas)
+        if: steps.modo.outputs.modo == 'oidc'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CFN_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ inputs.aws_region }}
+          mask-aws-account-id: true # repo público
+
+      - name: Credenciales AWS temporales (sesión SSO)
+        if: steps.modo.outputs.modo == 'temporal'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ inputs.aws_region }}
+          mask-aws-account-id: true # repo público
+
+      - name: Change set
+        id: cs
+        if: steps.modo.outputs.modo != 'simulado'
+        env:
+          REPO_URL: github.com/${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            type=UPDATE
+          else
+            type=CREATE
+          fi
+          cs="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # Los 13 tags de Redeban: los generales van al stack y CloudFormation los propaga
+          aws cloudformation create-change-set \
+            --stack-name "$STACK" --change-set-name "$cs" --change-set-type "$type" \
+            --template-body "file://$TEMPLATE" \
+            --parameters "ParameterKey=Prefijo,ParameterValue=$PREFIX" "ParameterKey=Ambiente,ParameterValue=$AWS_ENV" \
+            --tags \
+              "Key=Ambiente,Value=$AWS_ENV" \
+              "Key=Proyecto,Value=$PREFIX" \
+              "Key=Nombre,Value=$STACK" \
+              "Key=Descripcion,Value=Demo GitHub Actions" \
+              "Key=Area_Responsable,Value=Plataforma" \
+              "Key=ManagedBy,Value=CloudFormation" \
+              "Key=Criticidad,Value=Baja" \
+              "Key=Cumplimiento,Value=N/A" \
+              "Key=Repositorio,Value=$REPO_URL" \
+              "Key=Pipeline,Value=GitHub Actions" \
+              "Key=map-migrated,Value=mig42225" \
+              "Key=DRP,Value=No" \
+              "Key=aws-apn-id,Value=pc:ronpuzlj6e9gnj1c6dq4jldk" >/dev/null
+
+          if ! aws cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name "$cs"; then
+            reason=$(aws cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$cs" --query StatusReason --output text)
+            if [[ "$reason" == *"didn't contain changes"* || "$reason" == *"No updates"* ]]; then
+              aws cloudformation delete-change-set --stack-name "$STACK" --change-set-name "$cs"
+              echo "changes=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::$reason"; exit 1
+          fi
+
+          {
+            echo "## ☁️ CloudFormation · \`$STACK\` ($type)"
+            echo
+            echo "| Acción | Recurso | Tipo | ¿Reemplazo? |"
+            echo "|---|---|---|---|"
+            aws cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$cs" \
+              --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' --output text |
+              awk -F'\t' '{ printf "| %s | `%s` | %s | %s |\n", $1, $2, $3, ($4=="None"?"—":$4) }'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "name=$cs" >> "$GITHUB_OUTPUT"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+          echo "changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Ejecutar change set
+        if: steps.cs.outputs.changes == 'true'
+        run: |
+          aws cloudformation execute-change-set --stack-name "$STACK" --change-set-name "${{ steps.cs.outputs.name }}"
+          if [ "${{ steps.cs.outputs.type }}" = CREATE ]; then
+            aws cloudformation wait stack-create-complete --stack-name "$STACK"
+          else
+            aws cloudformation wait stack-update-complete --stack-name "$STACK"
+          fi
+
+      - name: Outputs del stack
+        id: out
+        run: |
+          if [ "${{ steps.modo.outputs.modo }}" = simulado ]; then
+            echo "url=https://${{ inputs.environment }}.demo.example.com" >> "$GITHUB_OUTPUT"
+            {
+              echo "## ☁️ CloudFormation · \`$STACK\`"
+              echo
+              echo "> 🧪 **Deploy simulado**: el environment \`${{ inputs.environment }}\` no tiene \`AWS_CFN_ROLE_ARN\` ni credenciales temporales."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          [ "${{ steps.cs.outputs.changes }}" = false ] && echo "> ✅ Sin cambios: el stack ya está al día." >> "$GITHUB_STEP_SUMMARY"
+
+          url=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='ConsoleUrl'].OutputValue" --output text)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Outputs"
+            echo
+            echo "| Output | Valor |"
+            echo "|---|---|"
+            aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query "Stacks[0].Outputs[?OutputKey!='TableArn'].[OutputKey,OutputValue]" --output text |
+              awk -F'\t' '{ printf "| %s | `%s` |\n", $1, $2 }'
+            echo
+            echo "| Ambiente AWS | Región | Rama | Commit |"
+            echo "|---|---|---|---|"
+            echo "| \`$AWS_ENV\` | $AWS_REGION | \`$GITHUB_REF_NAME\` | \`${GITHUB_SHA::7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

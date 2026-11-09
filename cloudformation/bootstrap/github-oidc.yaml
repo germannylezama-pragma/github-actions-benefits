@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Bootstrap (se despliega UNA vez, a mano): confianza OIDC de GitHub Actions y un rol
+  de mínimo privilegio que solo puede manejar stacks <prefijo>-<amb>-cfn-* y
+  tablas <prefijo>-<amb>-dynamodb-*. Solo lo asumen jobs del environment indicado.
+
+Parameters:
+  Prefijo:
+    Type: String
+    Default: gha-demo
+    AllowedPattern: "[a-zA-Z0-9-]+"
+  Ambiente:
+    Type: String
+    AllowedValues: [dev, staging, prod, test, cert]
+    Default: dev
+  GitHubEnvironment:
+    Type: String
+    Default: dev
+    Description: Environment de GitHub que puede asumir el rol
+  Repos:
+    Type: CommaDelimitedList
+    Default: germannylezama-pragma/github-actions-benefits,germannylezama-pragma/infra-equipo
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: ARN del provider token.actions.githubusercontent.com si ya existe en la cuenta (vacío = crearlo)
+
+Conditions:
+  CrearProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+
+Resources:
+  GitHubOidc:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CrearProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      Tags:
+        - Key: Nombre
+          Value: !Sub ${Prefijo}-${Ambiente}-oidc-github
+        - Key: Descripcion
+          Value: Confianza OIDC para GitHub Actions
+        - Key: Criticidad
+          Value: Media
+
+  RolDeploy:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefijo}-${Ambiente}-iam-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CrearProvider, !Ref GitHubOidc, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - !Sub
+                    - repo:${Repo}:environment:${GitHubEnvironment}
+                    - Repo: !Select [0, !Ref Repos]
+                  - !Sub
+                    - repo:${Repo}:environment:${GitHubEnvironment}
+                    - Repo: !Select [1, !Ref Repos]
+      Policies:
+        - PolicyName: cfn-dynamodb-demo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Stacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:DeleteStack
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Prefijo}-${Ambiente}-cfn-*/*
+              - Sid: ValidarPlantilla
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+              - Sid: Tablas
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefijo}-${Ambiente}-dynamodb-*
+              - Sid: LlaveAwsDynamo
+                Effect: Allow
+                Action: [kms:DescribeKey, kms:CreateGrant]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+      Tags:
+        - Key: Nombre
+          Value: !Sub ${Prefijo}-${Ambiente}-iam-deploy
+        - Key: Descripcion
+          Value: Rol que asume GitHub Actions por OIDC para la demo
+        - Key: Criticidad
+          Value: Media
+
+Outputs:
+  RoleArn:
+    Description: Poner como variable AWS_ROLE_ARN del environment de GitHub
+    Value: !GetAtt RolDeploy.Arn
