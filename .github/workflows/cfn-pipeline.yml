@@ -3,14 +3,12 @@ run-name: "CFN · ${{ github.base_ref || github.ref_name }} (${{ github.event_na
 
 # Polivalencia: mismo modelo de 3 fases que infra-pipeline.yml (Terraform),
 # reutilizando el MISMO reusable-contexto.yml, pero con otra herramienta de IaC.
-#   Fase 1: cfn-lint ∥ Checkov (framework cloudformation)
+#   Fase 1: cfn-lint ∥ Checkov sobre TODAS las plantillas de cloudformation/stacks/
 #   Fase 2: Summary + gate
-#   Fase 3: change set + deploy real por OIDC (solo ramas deploy/*)
+#   Fase 3: change set + deploy real (solo ramas deploy/*; despliega dynamodb-demo)
+# Los PR los revisa pr-cambios.yml, que analiza solo los archivos que cambian.
 
 on:
-  pull_request:
-    branches: [dev, staging, main, "deploy/**"]
-    paths: ["cloudformation/**", ".github/workflows/cfn-pipeline.yml", ".github/workflows/reusable-deploy-cfn.yml"]
   push:
     branches: [dev, staging, main, "deploy/**"]
   workflow_dispatch:
@@ -23,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  TEMPLATE: cloudformation/stacks/dynamodb-demo.yaml
+  STACKS_DIR: cloudformation/stacks # se analiza todo lo que haya aquí
 
 jobs:
   contexto:
@@ -42,7 +40,8 @@ jobs:
       - name: Validar sintaxis y propiedades
         run: |
           set +e
-          cfn-lint "$TEMPLATE" --format parseable > cfn-lint.txt
+          ls "$STACKS_DIR"/*.y*ml
+          cfn-lint "$STACKS_DIR"/*.y*ml --format parseable > cfn-lint.txt
           echo "rc=$?" > cfn-lint.rc
           cat cfn-lint.txt
       - uses: actions/upload-artifact@v4
@@ -60,9 +59,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install --quiet checkov
-      - name: Escanear plantilla
+      - name: Escanear todas las plantillas
         run: |
-          checkov -f "$TEMPLATE" --framework cloudformation --soft-fail \
+          checkov -d "$STACKS_DIR" --framework cloudformation --soft-fail \
             -o cli -o json --output-file-path console,checkov.json
       - uses: actions/upload-artifact@v4
         with:
