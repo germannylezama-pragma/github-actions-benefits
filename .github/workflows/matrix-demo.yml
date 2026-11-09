@@ -21,7 +21,7 @@ jobs:
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel }}
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }} # el input llega como texto
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node: [20, 22, 24]
